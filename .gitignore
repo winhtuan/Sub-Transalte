@@ -1,0 +1,44 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+
+# Go workspace file
+go.work
+go.work.sum
+
+# env files
+.env
+
+# Build output
+subtranslate.exe
+subtranslate
+
+# Application specific files
+.subtranslate_cache.json
+
+# IDE and OS
+.idea/
+.vscode/
+.DS_Store
+*~
+*.swp
+*.swo
+
+# Sub-agent/AI tools
+.agent/
+.agents/
+_agents/
+_agent/
+.gemini/

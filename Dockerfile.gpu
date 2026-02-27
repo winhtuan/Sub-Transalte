@@ -1,0 +1,28 @@
+FROM nvidia/cuda:12.2.0-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    python3 python3-pip git curl build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install GPU-enabled translation backend
+RUN pip install --no-cache-dir \
+    libretranslate \
+    ctranslate2[argos] \
+    argostranslate
+
+# GPU tuning (very important for 4GB VRAM)
+ENV CT2_FORCE_CUDA=1
+ENV CT2_CUDA_ALLOW_FP16=1
+ENV CUDA_VISIBLE_DEVICES=0
+ENV CT2_CUDA_MEMORY_FRACTION=0.7
+
+# LibreTranslate tuning
+ENV LT_LOAD_ONLY=en,vi
+ENV LT_DISABLE_WEB_UI=true
+ENV LT_DISABLE_FILES_TRANSLATION=true
+ENV LT_THREADS=1
+
+EXPOSE 5000
+CMD ["libretranslate", "--host", "0.0.0.0", "--port", "5000"]

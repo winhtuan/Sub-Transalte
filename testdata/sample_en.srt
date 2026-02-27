@@ -1,0 +1,21 @@
+1
+00:00:01,000 --> 00:00:04,000
+Hello, welcome to the show.
+
+2
+00:00:05,000 --> 00:00:08,000
+Today we will learn about
+machine learning and AI.
+
+3
+00:00:09,000 --> 00:00:12,500
+<i>This is an important concept</i>
+that you should understand.
+
+4
+00:00:13,000 --> 00:00:15,000
+Thank you for watching!
+
+5
+00:00:16,000 --> 00:00:18,000
+[Music]
