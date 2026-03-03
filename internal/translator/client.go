@@ -8,8 +8,10 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"math/rand"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -59,7 +61,7 @@ type Metrics struct {
 	TotalLatencyNs atomic.Int64 // Cumulative API latency in nanoseconds
 }
 
-// Snapshot returns a point-in-time copy of all metrics.
+// MetricsSnapshot is a point-in-time copy of all metrics.
 type MetricsSnapshot struct {
 	APICalls   int64
 	Retries    int64
@@ -117,7 +119,11 @@ type ProgressFunc func(completed, total int, state string)
 
 // NewClient creates a new LibreTranslate client with connection pooling
 // and CPU-friendly request throttling.
+// If logger is nil, slog.Default() is used.
 func NewClient(apiURL string, ratePerSec float64, maxRetries, batchSize int, requestDelay, batchTimeout time.Duration, cache *Cache, logger *slog.Logger) *Client {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	burst := max(int(ratePerSec), 3)
 
 	transport := &http.Transport{
@@ -185,15 +191,19 @@ func (c *Client) TranslateTexts(ctx context.Context, texts []string, onProgress 
 }
 
 // translateBatched splits texts into batches and translates each batch.
+// The batch size is read fresh on every iteration so that adaptive throttle
+// adjustments take effect immediately for subsequent batches.
 func (c *Client) translateBatched(ctx context.Context, texts []string, onProgress ProgressFunc, totalLines, cacheHits int) ([]string, error) {
 	allResults := make([]string, 0, len(texts))
 
-	bs := c.getEffectiveBatchSize()
-	for i := 0; i < len(texts); i += bs {
+	for i := 0; i < len(texts); {
 		if err := ctx.Err(); err != nil {
 			return nil, fmt.Errorf("translation cancelled: %w", err)
 		}
 
+		// Dynamic batch size: read fresh every iteration so throttle adjustments
+		// apply to the very next batch without waiting for the file to finish.
+		bs := c.getEffectiveBatchSize()
 		end := i + bs
 		if end > len(texts) {
 			end = len(texts)
@@ -203,7 +213,6 @@ func (c *Client) translateBatched(ctx context.Context, texts []string, onProgres
 		// Apply per-batch timeout (nested inside the per-file timeout).
 		batchCtx, batchCancel := context.WithTimeout(ctx, c.batchTimeout)
 
-		// Report state: translating.
 		if onProgress != nil {
 			onProgress(cacheHits+len(allResults), totalLines, "translating")
 		}
@@ -211,29 +220,27 @@ func (c *Client) translateBatched(ctx context.Context, texts []string, onProgres
 		translated, err := c.translateBatch(batchCtx, batch, onProgress, cacheHits+len(allResults), totalLines)
 		batchCancel() // Always cancel immediately after use — NOT deferred (avoid leak in loop).
 		if err != nil {
-			// Fallback: translate one-by-one.
-			c.logger.Warn("batch translation failed, falling back to one-by-one",
+			// Binary split fallback: isolates failing line in O(log N) calls instead
+			// of O(N) one-by-one retries.  Uses ctx (not the already-expired batchCtx).
+			c.logger.Warn("batch translation failed, falling back to binary split",
 				"batch_start", i, "batch_size", len(batch), "error", err)
 
-			for _, text := range batch {
-				if err := ctx.Err(); err != nil {
-					return nil, fmt.Errorf("translation cancelled: %w", err)
-				}
-				single, sErr := c.translateSingle(ctx, text)
-				if sErr != nil {
-					c.metrics.TotalErrors.Add(1)
-					return nil, fmt.Errorf("translating text: %w", sErr)
-				}
-				allResults = append(allResults, single)
+			split, sErr := c.translateSplit(ctx, batch)
+			if sErr != nil {
+				c.metrics.TotalErrors.Add(1)
+				return nil, fmt.Errorf("translating batch at offset %d: %w", i, sErr)
+			}
+			allResults = append(allResults, split...)
+			i += len(batch)
 
-				if onProgress != nil {
-					onProgress(cacheHits+len(allResults), totalLines, "translating")
-				}
+			if onProgress != nil {
+				onProgress(cacheHits+len(allResults), totalLines, "translating")
 			}
 			continue
 		}
 
 		allResults = append(allResults, translated...)
+		i += len(batch)
 
 		if onProgress != nil {
 			onProgress(cacheHits+len(allResults), totalLines, "translating")
@@ -243,7 +250,30 @@ func (c *Client) translateBatched(ctx context.Context, texts []string, onProgres
 	return allResults, nil
 }
 
-// translateBatch sends a batch with retry logic.
+// translateSplit recursively halves a batch to isolate failing lines.
+// This replaces the O(N) one-by-one fallback with an O(log N) binary search.
+// Uses ctx (not batchCtx which is already cancelled when this is called).
+func (c *Client) translateSplit(ctx context.Context, texts []string) ([]string, error) {
+	if len(texts) == 0 {
+		return nil, nil
+	}
+	if len(texts) == 1 {
+		result, err := c.translateSingle(ctx, texts[0])
+		return []string{result}, err
+	}
+	mid := len(texts) / 2
+	left, err := c.translateSplit(ctx, texts[:mid])
+	if err != nil {
+		return nil, err
+	}
+	right, err := c.translateSplit(ctx, texts[mid:])
+	if err != nil {
+		return nil, err
+	}
+	return append(left, right...), nil
+}
+
+// translateBatch sends a batch with retry + exponential backoff with equal jitter.
 func (c *Client) translateBatch(ctx context.Context, texts []string, onProgress ProgressFunc, currentCompleted, totalLines int) ([]string, error) {
 	var lastErr error
 
@@ -253,7 +283,7 @@ func (c *Client) translateBatch(ctx context.Context, texts []string, onProgress 
 		}
 
 		start := time.Now()
-		result, statusCode, err := c.doTranslateBatchRequest(ctx, texts)
+		result, statusCode, retryAfter, err := c.doTranslateBatchRequest(ctx, texts)
 		latency := time.Since(start)
 		c.metrics.TotalAPICalls.Add(1)
 		c.metrics.TotalLatencyNs.Add(int64(latency))
@@ -274,7 +304,7 @@ func (c *Client) translateBatch(ctx context.Context, texts []string, onProgress 
 		c.metrics.TotalRetries.Add(1)
 
 		if attempt < c.maxRetries {
-			backoff := time.Duration(math.Pow(2, float64(attempt))) * time.Second
+			backoff := jitterBackoff(attempt, retryAfter)
 
 			if onProgress != nil {
 				onProgress(currentCompleted, totalLines, "retrying")
@@ -296,7 +326,7 @@ func (c *Client) translateBatch(ctx context.Context, texts []string, onProgress 
 	return nil, fmt.Errorf("all %d retries exhausted: %w", c.maxRetries, lastErr)
 }
 
-// translateSingle sends a single translation request with retry logic.
+// translateSingle sends a single translation request with retry + jitter backoff.
 func (c *Client) translateSingle(ctx context.Context, text string) (string, error) {
 	var lastErr error
 
@@ -306,7 +336,7 @@ func (c *Client) translateSingle(ctx context.Context, text string) (string, erro
 		}
 
 		start := time.Now()
-		result, statusCode, err := c.doTranslateRequest(ctx, text)
+		result, statusCode, retryAfter, err := c.doTranslateRequest(ctx, text)
 		c.metrics.TotalAPICalls.Add(1)
 		c.metrics.TotalLatencyNs.Add(int64(time.Since(start)))
 
@@ -323,7 +353,7 @@ func (c *Client) translateSingle(ctx context.Context, text string) (string, erro
 		c.metrics.TotalRetries.Add(1)
 
 		if attempt < c.maxRetries {
-			backoff := time.Duration(math.Pow(2, float64(attempt))) * time.Second
+			backoff := jitterBackoff(attempt, retryAfter)
 			c.logger.Warn("retrying translation",
 				"attempt", attempt+1,
 				"max_retries", c.maxRetries,
@@ -338,6 +368,25 @@ func (c *Client) translateSingle(ctx context.Context, text string) (string, erro
 	}
 
 	return "", fmt.Errorf("all %d retries exhausted: %w", c.maxRetries, lastErr)
+}
+
+// jitterBackoff computes a retry delay using the equal jitter strategy.
+// If retryAfter > 0 (from a Retry-After header) it is used directly.
+//
+// Equal jitter: backoff = base/2 + rand(0..base/2)
+// This prevents thundering herd across workers while bounding the wait time.
+func jitterBackoff(attempt int, retryAfter time.Duration) time.Duration {
+	if retryAfter > 0 {
+		return retryAfter
+	}
+	base := time.Duration(math.Pow(2, float64(attempt))) * time.Second
+	half := int64(base / 2)
+	if half <= 0 {
+		return base
+	}
+	// math/rand is auto-seeded since Go 1.20 — no explicit seed needed.
+	jitter := time.Duration(rand.Int63n(half + 1))
+	return base/2 + jitter
 }
 
 // waitBeforeRequest applies rate limiting and request delay.
@@ -363,7 +412,9 @@ func (c *Client) waitBeforeRequest(ctx context.Context, onProgress ProgressFunc,
 }
 
 // doTranslateBatchRequest performs a batch HTTP POST to /translate.
-func (c *Client) doTranslateBatchRequest(ctx context.Context, texts []string) ([]string, int, error) {
+// Returns (results, statusCode, retryAfter, error).
+// retryAfter is parsed from the Retry-After header on HTTP 429.
+func (c *Client) doTranslateBatchRequest(ctx context.Context, texts []string) ([]string, int, time.Duration, error) {
 	reqBody := translateBatchRequest{
 		Q:      texts,
 		Source: "en",
@@ -372,49 +423,55 @@ func (c *Client) doTranslateBatchRequest(ctx context.Context, texts []string) ([
 
 	bodyBytes, err := json.Marshal(reqBody)
 	if err != nil {
-		return nil, 0, fmt.Errorf("marshaling request: %w", err)
+		return nil, 0, 0, fmt.Errorf("marshaling request: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		c.apiURL+"/translate", bytes.NewReader(bodyBytes))
 	if err != nil {
-		return nil, 0, fmt.Errorf("creating request: %w", err)
+		return nil, 0, 0, fmt.Errorf("creating request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, 0, fmt.Errorf("HTTP request: %w", err)
+		return nil, 0, 0, fmt.Errorf("HTTP request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, resp.StatusCode, fmt.Errorf("reading response: %w", err)
+		return nil, resp.StatusCode, 0, fmt.Errorf("reading response: %w", err)
+	}
+
+	var retryAfter time.Duration
+	if resp.StatusCode == http.StatusTooManyRequests {
+		retryAfter = parseRetryAfter(resp.Header.Get("Retry-After"))
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		var errResp translateErrorResponse
 		_ = json.Unmarshal(respBody, &errResp)
-		return nil, resp.StatusCode, fmt.Errorf("API error (HTTP %d): %s",
+		return nil, resp.StatusCode, retryAfter, fmt.Errorf("API error (HTTP %d): %s",
 			resp.StatusCode, errResp.Error)
 	}
 
 	var result translateBatchResponse
 	if err := json.Unmarshal(respBody, &result); err != nil {
-		return nil, resp.StatusCode, fmt.Errorf("parsing response JSON: %w", err)
+		return nil, resp.StatusCode, 0, fmt.Errorf("parsing response JSON: %w", err)
 	}
 
 	if len(result.TranslatedText) != len(texts) {
-		return nil, resp.StatusCode, fmt.Errorf("response count mismatch: expected %d, got %d",
+		return nil, resp.StatusCode, 0, fmt.Errorf("response count mismatch: expected %d, got %d",
 			len(texts), len(result.TranslatedText))
 	}
 
-	return result.TranslatedText, resp.StatusCode, nil
+	return result.TranslatedText, resp.StatusCode, 0, nil
 }
 
 // doTranslateRequest performs a single HTTP POST to /translate.
-func (c *Client) doTranslateRequest(ctx context.Context, text string) (string, int, error) {
+// Returns (result, statusCode, retryAfter, error).
+func (c *Client) doTranslateRequest(ctx context.Context, text string) (string, int, time.Duration, error) {
 	reqBody := translateRequest{
 		Q:      text,
 		Source: "en",
@@ -423,40 +480,68 @@ func (c *Client) doTranslateRequest(ctx context.Context, text string) (string, i
 
 	bodyBytes, err := json.Marshal(reqBody)
 	if err != nil {
-		return "", 0, fmt.Errorf("marshaling request: %w", err)
+		return "", 0, 0, fmt.Errorf("marshaling request: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		c.apiURL+"/translate", bytes.NewReader(bodyBytes))
 	if err != nil {
-		return "", 0, fmt.Errorf("creating request: %w", err)
+		return "", 0, 0, fmt.Errorf("creating request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", 0, fmt.Errorf("HTTP request: %w", err)
+		return "", 0, 0, fmt.Errorf("HTTP request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", resp.StatusCode, fmt.Errorf("reading response: %w", err)
+		return "", resp.StatusCode, 0, fmt.Errorf("reading response: %w", err)
+	}
+
+	var retryAfter time.Duration
+	if resp.StatusCode == http.StatusTooManyRequests {
+		retryAfter = parseRetryAfter(resp.Header.Get("Retry-After"))
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		var errResp translateErrorResponse
 		_ = json.Unmarshal(respBody, &errResp)
-		return "", resp.StatusCode, fmt.Errorf("API error (HTTP %d): %s",
+		return "", resp.StatusCode, retryAfter, fmt.Errorf("API error (HTTP %d): %s",
 			resp.StatusCode, errResp.Error)
 	}
 
 	var result translateResponse
 	if err := json.Unmarshal(respBody, &result); err != nil {
-		return "", resp.StatusCode, fmt.Errorf("parsing response JSON: %w", err)
+		return "", resp.StatusCode, 0, fmt.Errorf("parsing response JSON: %w", err)
 	}
 
-	return result.TranslatedText, resp.StatusCode, nil
+	return result.TranslatedText, resp.StatusCode, 0, nil
+}
+
+// parseRetryAfter parses the value of the Retry-After HTTP header.
+// It supports two formats:
+//   - Integer seconds:  "120"
+//   - HTTP-date:        "Fri, 31 Dec 1999 23:59:59 GMT"
+//
+// Returns 0 if the header is absent, zero, or cannot be parsed.
+func parseRetryAfter(header string) time.Duration {
+	if header == "" {
+		return 0
+	}
+	// Try integer seconds first.
+	if secs, err := strconv.Atoi(strings.TrimSpace(header)); err == nil && secs > 0 {
+		return time.Duration(secs) * time.Second
+	}
+	// Try HTTP-date.
+	if t, err := http.ParseTime(header); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
 }
 
 // isRetryable returns true if the request should be retried.

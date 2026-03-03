@@ -42,3 +42,5 @@ subtranslate
 _agents/
 _agent/
 .gemini/
+.claude/
+CLAUDE.md

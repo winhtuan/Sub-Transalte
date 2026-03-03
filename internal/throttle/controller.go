@@ -1,7 +1,6 @@
 package throttle
 
 import (
-	"math"
 	"sync/atomic"
 	"time"
 )
@@ -18,11 +17,11 @@ const (
 )
 
 // ═══════════════════════════════════════════════════════════════════════
-// Params — lock-free values read by workers
+// Params — lock-free values read by workers on the hot path
 // ═══════════════════════════════════════════════════════════════════════
 
 // Params holds live-adjustable throttling parameters.
-// Workers read these atomically before each request.
+// Workers read these atomically before each request; Run() writes them.
 type Params struct {
 	Delay     atomic.Int64 // nanoseconds
 	BatchSize atomic.Int32
@@ -32,31 +31,28 @@ type Params struct {
 // Controller
 // ═══════════════════════════════════════════════════════════════════════
 
-// Controller is the adaptive throttle controller. It observes per-request
-// metrics and adjusts Params in a background goroutine.
+// Controller is the adaptive throttle controller.
+//
+// Workers call RecordRequest() which does a non-blocking send on metricsCh.
+// The Run() goroutine is the sole owner of all EWMA/counter/state variables;
+// it processes the channel in its select loop, eliminating the CAS spin loops
+// that existed in the previous design.
+//
+// Params (Delay, BatchSize) are written by Run() and read by workers via
+// atomic operations — the worker hot path remains fully lock-free.
 type Controller struct {
-	cfg    Config
-	Params Params
-
-	// Metrics (lock-free, written by workers via RecordRequest)
-	ewmaLatencyNs atomic.Int64
-	decayReqsX1k  atomic.Int64 // decayed request count × 1000 (fixed-point)
-	decayErrsX1k  atomic.Int64 // decayed error count × 1000 (fixed-point)
-	consecSuccess atomic.Int64
-	baselineNs    atomic.Int64
-
-	// Calibration state
-	state      atomic.Int32
-	reqCount   atomic.Int32
-	calibMinNs atomic.Int64 // minimum EWMA observed during calibration
+	cfg       Config
+	Params    Params
+	metricsCh chan requestMetric // buffered 256; RecordRequest does non-blocking send
 }
 
 // New creates a Controller with the given config and initial parameter values.
 func New(cfg Config, initialDelay time.Duration, initialBatch int) *Controller {
-	c := &Controller{cfg: cfg}
+	c := &Controller{
+		cfg:       cfg,
+		metricsCh: make(chan requestMetric, 256),
+	}
 	c.Params.Delay.Store(int64(initialDelay))
 	c.Params.BatchSize.Store(int32(initialBatch))
-	c.state.Store(stateWarmup)
-	c.calibMinNs.Store(math.MaxInt64)
 	return c
 }

@@ -102,7 +102,7 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*report.
 	}
 
 	// ── Phase 2: Cache + Translator ───────────────────────────────────
-	cache := translator.NewCache(10000)
+	cache := translator.NewCacheWithTTL(10000, cfg.CacheTTL)
 	if loadErr := cache.Load(cfg.CacheFile); loadErr != nil {
 		logger.Warn("could not load translation cache, starting fresh", "error", loadErr)
 	} else {
@@ -178,25 +178,32 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*report.
 				lines, hits, err := processFile(fileCtx, job.filePath, client, baseName, onProgress, dash, workerID, logger.With("worker", workerID))
 				cancel()
 
+				// Build log message and persist job state outside the mutex to
+				// minimise lock hold time (5.2).
+				var logMsg string
+				if err != nil {
+					logMsg = fmt.Sprintf("  %s✗ W%d%s  %s  %s→ %v%s",
+						cRed, workerID, cReset, baseName, cDim, err, cReset)
+					_ = jobState.MarkFailed(job.filePath)
+				} else {
+					outName := filepath.Base(scanner.OutputPath(job.filePath))
+					logMsg = fmt.Sprintf("  %s✓ W%d%s  %s  →  %s%s%s  %s(%d dòng, %d cache)%s",
+						cGreen, workerID, cReset, baseName,
+						cCyan, outName, cReset,
+						cDim, lines, hits, cReset)
+					_ = jobState.MarkSuccess(job.filePath)
+				}
+
 				mu.Lock()
 				if err != nil {
 					stats.Failed++
 					stats.FailedFiles = append(stats.FailedFiles, job.filePath)
-					logMsg := fmt.Sprintf("  %s✗ W%d%s  %s  %s→ %v%s",
-						cRed, workerID, cReset, baseName, cDim, err, cReset)
 					dash.markWorkerDone(workerID, 0, 0, logMsg)
-					_ = jobState.MarkDone(job.filePath) // mark failed too to avoid re-trying unless --resume
 				} else {
 					stats.Succeeded++
 					stats.TotalLines += lines
 					stats.CacheHits += hits
-					outName := filepath.Base(scanner.OutputPath(job.filePath))
-					logMsg := fmt.Sprintf("  %s✓ W%d%s  %s  →  %s%s%s  %s(%d dòng, %d cache)%s",
-						cGreen, workerID, cReset, baseName,
-						cCyan, outName, cReset,
-						cDim, lines, hits, cReset)
 					dash.markWorkerDone(workerID, lines, hits, logMsg)
-					_ = jobState.MarkDone(job.filePath)
 				}
 				mu.Unlock()
 

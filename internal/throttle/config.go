@@ -3,8 +3,13 @@
 // API latency and error signals using an AIMD (Additive Increase / Multiplicative
 // Decrease) strategy — the same algorithm that powers TCP congestion control.
 //
-// The controller runs a background decision loop (every 2s) and exposes
-// parameters via atomic values so workers read them lock-free.
+// # Architecture
+//
+// Workers call RecordRequest() (non-blocking) → metrics are sent over a
+// buffered channel → the Run() goroutine is the sole owner of all EWMA/counter
+// state, updating them sequentially without any CAS spin loops.
+// Params (Delay, BatchSize) are written by Run() via atomic stores and read
+// by workers via atomic loads — the hot path is entirely lock-free.
 package throttle
 
 import (
@@ -15,7 +20,7 @@ import (
 // Config sets the boundaries and tuning knobs for adaptive throttling.
 type Config struct {
 	MinDelay      time.Duration // Floor for request delay (e.g., 50ms)
-	MaxDelay      time.Duration // Ceiling floor (actual ceiling = max(this, 3×baseline))
+	MaxDelay      time.Duration // Ceiling (actual ceiling = max(this, 3×baseline))
 	MinBatchSize  int           // Smallest batch allowed (e.g., 5)
 	MaxBatchSize  int           // Original cfg.BatchSize
 	Alpha         float64       // EWMA smoothing factor (0.3)
@@ -28,26 +33,31 @@ type Config struct {
 	DecayFactor   float64       // Error counter decay multiplier (0.8)
 	WarmupSkip    int           // Requests to skip during warm-up (3)
 	CalibrationN  int           // Requests to calibrate over (15)
-	Logger        *slog.Logger
+	// RecalibrationInterval controls how often the baseline is smoothly updated
+	// from observed EWMA when the system is stable (error rate < 5%).
+	// Set to 0 to disable periodic recalibration.
+	RecalibrationInterval time.Duration
+	Logger                *slog.Logger
 }
 
 // DefaultConfig returns a Config with production-ready defaults.
 func DefaultConfig(maxBatchSize int, logger *slog.Logger) Config {
 	return Config{
-		MinDelay:      50 * time.Millisecond,
-		MaxDelay:      5 * time.Second,
-		MinBatchSize:  5,
-		MaxBatchSize:  maxBatchSize,
-		Alpha:         0.3,
-		BackoffFactor: 2.0,
-		BatchBackoff:  0.7,
-		IncreaseStep:  20 * time.Millisecond,
-		CooldownTime:  10 * time.Second,
-		DecisionTick:  2 * time.Second,
-		DecayInterval: 5 * time.Second,
-		DecayFactor:   0.8,
-		WarmupSkip:    3,
-		CalibrationN:  15,
-		Logger:        logger,
+		MinDelay:              50 * time.Millisecond,
+		MaxDelay:              5 * time.Second,
+		MinBatchSize:          5,
+		MaxBatchSize:          maxBatchSize,
+		Alpha:                 0.3,
+		BackoffFactor:         2.0,
+		BatchBackoff:          0.7,
+		IncreaseStep:          20 * time.Millisecond,
+		CooldownTime:          10 * time.Second,
+		DecisionTick:          2 * time.Second,
+		DecayInterval:         5 * time.Second,
+		DecayFactor:           0.8,
+		WarmupSkip:            3,
+		CalibrationN:          15,
+		RecalibrationInterval: 5 * time.Minute,
+		Logger:                logger,
 	}
 }

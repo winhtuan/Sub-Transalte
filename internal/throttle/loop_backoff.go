@@ -2,6 +2,7 @@ package throttle
 
 import (
 	"context"
+	"math"
 	"time"
 )
 
@@ -9,8 +10,28 @@ import (
 // Run — background decision loop
 // ═══════════════════════════════════════════════════════════════════════
 
-// Run starts the adaptive throttling decision loop. It blocks until ctx is cancelled.
-// Call as: go controller.Run(ctx)
+// Run starts the adaptive throttling decision loop. It blocks until ctx is
+// cancelled.  Call as: go controller.Run(ctx)
+//
+// All mutable state (EWMA, counters, state machine, cooldown timer) is owned
+// exclusively by this goroutine — no locks needed for that state.
+// Only Params (Delay, BatchSize) are shared with workers via atomic ops.
+//
+// # State machine
+//
+//	stateWarmup → stateCalibrating → stateNormal ⇄ stateCooldown
+//
+// Transitions happen on two triggers:
+//  1. A requestMetric arrives on metricsCh (warmup/calibration transitions,
+//     immediate back-off for HTTP 429/5xx).
+//  2. The decision ticker fires (AIMD recovery/backoff, cooldown expiry check,
+//     periodic baseline recalibration).
+//
+// # Work-stealing note
+//
+// Full dynamic work-stealing is not implemented here.  Subtitle files are
+// uniform in size, so a static worker pool with a fixed file queue delivers
+// near-optimal utilisation without the complexity of work-stealing queues.
 func (c *Controller) Run(ctx context.Context) {
 	ticker := time.NewTicker(c.cfg.DecisionTick)
 	defer ticker.Stop()
@@ -18,77 +39,153 @@ func (c *Controller) Run(ctx context.Context) {
 	decayTicker := time.NewTicker(c.cfg.DecayInterval)
 	defer decayTicker.Stop()
 
-	stableCycles := 0
+	// ── Local state (owned exclusively by this goroutine) ──────────────
+	var (
+		ewmaLatencyNs  int64   = 0
+		decayReqsX1k   int64   = 0
+		decayErrsX1k   int64   = 0
+		consecSuccess  int64   = 0
+		baselineNs     int64   = 0
+		state          int32   = stateWarmup
+		reqCount       int32   = 0
+		calibMinNs     int64   = math.MaxInt64
+		stableCycles   int     = 0
+		cooldownUntil  time.Time
+		lastRecalib    time.Time
+	)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 
+		// ── Process an incoming metric ────────────────────────────────
+		case m := <-c.metricsCh:
+			ns := m.latency.Nanoseconds()
+			success := m.statusCode >= 200 && m.statusCode < 300
+
+			// Update EWMA latency.
+			alpha := c.cfg.Alpha
+			if ewmaLatencyNs == 0 {
+				ewmaLatencyNs = ns
+			} else {
+				ewmaLatencyNs = int64(alpha*float64(ns) + (1-alpha)*float64(ewmaLatencyNs))
+			}
+
+			// Decayed counters (fixed-point ×1000).
+			decayReqsX1k += 1000
+			if !success {
+				decayErrsX1k += 1000
+			}
+
+			// Consecutive success tracker.
+			if success {
+				consecSuccess++
+			} else {
+				consecSuccess = 0
+			}
+
+			reqCount++
+			curState := state
+
+			// ── Warmup → Calibrating ──
+			if curState == stateWarmup && int(reqCount) >= c.cfg.WarmupSkip {
+				ewmaLatencyNs = ns // Reset EWMA for clean calibration start.
+				reqCount = 0
+				state = stateCalibrating
+				continue
+			}
+
+			// ── Calibrating → Normal ──
+			if curState == stateCalibrating {
+				if ewmaLatencyNs < calibMinNs {
+					calibMinNs = ewmaLatencyNs
+				}
+				if int(reqCount) >= c.cfg.CalibrationN {
+					// baseline = min(EWMA during calibration) × 1.1 safety margin.
+					baselineNs = int64(float64(calibMinNs) * 1.1)
+					state = stateNormal
+					lastRecalib = time.Now()
+					c.cfg.Logger.Info("[throttle] calibration complete",
+						"baseline", time.Duration(baselineNs),
+						"ewma", time.Duration(ewmaLatencyNs),
+					)
+				}
+			}
+
+			// ── Immediate back-off for 429 / 5xx ──
+			// (only after calibration is done)
+			if state == stateNormal || state == stateCooldown {
+				if m.statusCode == 429 {
+					cooldownUntil = applyBackoff(&c.Params, baselineNs, c.cfg, 3.0, false, "http_429",
+						ewmaLatencyNs)
+					state = stateCooldown
+				} else if m.statusCode >= 500 {
+					cooldownUntil = applyBackoff(&c.Params, baselineNs, c.cfg, c.cfg.BackoffFactor, false, "http_5xx",
+						ewmaLatencyNs)
+					state = stateCooldown
+				}
+			}
+
+		// ── Decay error / request counters ───────────────────────────
 		case <-decayTicker.C:
-			// Exponential decay of error/request counters.
-			factor := c.cfg.DecayFactor
-			for {
-				old := c.decayReqsX1k.Load()
-				newVal := int64(float64(old) * factor)
-				if c.decayReqsX1k.CompareAndSwap(old, newVal) {
-					break
-				}
-			}
-			for {
-				old := c.decayErrsX1k.Load()
-				newVal := int64(float64(old) * factor)
-				if c.decayErrsX1k.CompareAndSwap(old, newVal) {
-					break
-				}
-			}
+			decayReqsX1k = int64(float64(decayReqsX1k) * c.cfg.DecayFactor)
+			decayErrsX1k = int64(float64(decayErrsX1k) * c.cfg.DecayFactor)
 
+		// ── Decision tick ─────────────────────────────────────────────
 		case <-ticker.C:
-			curState := c.state.Load()
-
-			// Skip if still calibrating.
-			if curState == stateWarmup || curState == stateCalibrating {
+			if state == stateWarmup || state == stateCalibrating {
 				continue
 			}
-
-			// Check cooldown expiration.
-			if curState == stateCooldown {
-				// lastBackoff is checked in applyBackoff; here we just check time.
-				stableCycles = 0
-				// Allow transition back to normal after cooldown.
-				c.state.CompareAndSwap(stateCooldown, stateNormal)
-				continue
-			}
-
-			// ── Read metrics ──
-			baseline := c.baselineNs.Load()
-			ewma := c.ewmaLatencyNs.Load()
-			curDelay := time.Duration(c.Params.Delay.Load())
-			curBatch := int(c.Params.BatchSize.Load())
-			reqs := c.decayReqsX1k.Load()
-			errs := c.decayErrsX1k.Load()
 
 			errorRate := 0.0
-			if reqs > 0 {
-				errorRate = float64(errs) / float64(reqs)
+			if decayReqsX1k > 0 {
+				errorRate = float64(decayErrsX1k) / float64(decayReqsX1k)
 			}
 
-			// ── BACK-OFF check ──
-			if ewma > 2*baseline {
+			// ── Cooldown expiry check ──
+			if state == stateCooldown {
+				if time.Now().After(cooldownUntil) {
+					// Recovery validation: must meet both conditions to exit cooldown.
+					if ewmaLatencyNs < int64(float64(baselineNs)*1.5) && errorRate < 0.05 {
+						state = stateNormal
+						stableCycles = 0
+					} else {
+						// Conditions not met — extend cooldown.
+						cooldownUntil = time.Now().Add(c.cfg.CooldownTime)
+						c.cfg.Logger.Warn("[throttle] extending cooldown — conditions not met",
+							"ewma", time.Duration(ewmaLatencyNs),
+							"baseline", time.Duration(baselineNs),
+							"errorRate", errorRate,
+						)
+					}
+				}
+				continue
+			}
+
+			// ── Normal state: BACK-OFF checks ──
+			curDelay := time.Duration(c.Params.Delay.Load())
+			curBatch := int(c.Params.BatchSize.Load())
+
+			if ewmaLatencyNs > 2*baselineNs {
 				stableCycles = 0
-				c.applyBackoff(c.cfg.BackoffFactor, false, "latency_spike")
+				cooldownUntil = applyBackoff(&c.Params, baselineNs, c.cfg, c.cfg.BackoffFactor, false, "latency_spike",
+					ewmaLatencyNs)
+				state = stateCooldown
 				continue
 			}
 			if errorRate > 0.10 {
 				stableCycles = 0
-				c.applyBackoff(c.cfg.BackoffFactor, true, "error_rate")
+				cooldownUntil = applyBackoff(&c.Params, baselineNs, c.cfg, c.cfg.BackoffFactor, true, "error_rate",
+					ewmaLatencyNs)
+				state = stateCooldown
 				continue
 			}
 
-			// ── RECOVERY check (all conditions must hold for 5 cycles) ──
-			if ewma < int64(float64(baseline)*1.2) &&
+			// ── RECOVERY check (all conditions for 5 consecutive cycles) ──
+			if ewmaLatencyNs < int64(float64(baselineNs)*1.2) &&
 				errorRate == 0 &&
-				c.consecSuccess.Load() >= 10 {
+				consecSuccess >= 10 {
 				stableCycles++
 			} else {
 				stableCycles = 0
@@ -97,9 +194,9 @@ func (c *Controller) Run(ctx context.Context) {
 			if stableCycles >= 5 {
 				stableCycles = 0
 
-				// Adaptive delay decrease: max(20ms, 10% of baseline)
+				// Adaptive delay decrease: max(MinIncreaseStep, 10% of baseline).
 				step := c.cfg.IncreaseStep
-				baselineStep := time.Duration(float64(baseline) * 0.1)
+				baselineStep := time.Duration(float64(baselineNs) * 0.1)
 				if baselineStep > step {
 					step = baselineStep
 				}
@@ -109,7 +206,7 @@ func (c *Controller) Run(ctx context.Context) {
 				}
 				c.Params.Delay.Store(int64(newDelay))
 
-				// Batch: additive +1
+				// Batch: additive +1.
 				newBatch := curBatch + 1
 				if newBatch > c.cfg.MaxBatchSize {
 					newBatch = c.cfg.MaxBatchSize
@@ -119,22 +216,41 @@ func (c *Controller) Run(ctx context.Context) {
 				c.cfg.Logger.Info("[throttle] recovery",
 					"delay", newDelay,
 					"batch", newBatch,
-					"ewma", time.Duration(ewma),
-					"baseline", time.Duration(baseline),
+					"ewma", time.Duration(ewmaLatencyNs),
+					"baseline", time.Duration(baselineNs),
 					"errorRate", errorRate,
 				)
 			} else {
-				// Periodic telemetry even when no action is taken.
 				c.cfg.Logger.Debug("[throttle] status",
 					"state", "normal",
 					"delay", curDelay,
 					"batch", curBatch,
-					"ewma", time.Duration(ewma),
-					"baseline", time.Duration(baseline),
+					"ewma", time.Duration(ewmaLatencyNs),
+					"baseline", time.Duration(baselineNs),
 					"errorRate", errorRate,
 					"stable", stableCycles,
-					"consec", c.consecSuccess.Load(),
+					"consec", consecSuccess,
 				)
+			}
+
+			// ── Periodic baseline recalibration ──
+			// Only recalibrate if stable (low error rate) and interval has elapsed.
+			if c.cfg.RecalibrationInterval > 0 &&
+				time.Since(lastRecalib) >= c.cfg.RecalibrationInterval &&
+				errorRate < 0.05 &&
+				ewmaLatencyNs > 0 {
+
+				// Smooth update: new = 0.9*old + 0.1*(ewma*1.1).
+				candidate := int64(0.9*float64(baselineNs) + 0.1*float64(ewmaLatencyNs)*1.1)
+				// Only lower the baseline (never make it worse).
+				if candidate < baselineNs {
+					baselineNs = candidate
+					c.cfg.Logger.Info("[throttle] baseline recalibrated",
+						"baseline", time.Duration(baselineNs),
+						"ewma", time.Duration(ewmaLatencyNs),
+					)
+				}
+				lastRecalib = time.Now()
 			}
 		}
 	}
@@ -144,67 +260,55 @@ func (c *Controller) Run(ctx context.Context) {
 // applyBackoff — multiplicative decrease with hysteresis
 // ═══════════════════════════════════════════════════════════════════════
 
-func (c *Controller) applyBackoff(delayFactor float64, reduceBatch bool, trigger string) {
-	curDelay := time.Duration(c.Params.Delay.Load())
-	curBatch := int(c.Params.BatchSize.Load())
+// applyBackoff updates Params (delay, optionally batch) multiplicatively
+// and returns the time when cooldown should expire.
+// This is called exclusively from the Run() goroutine, so no locking is needed.
+func applyBackoff(params *Params, baselineNs int64, cfg Config,
+	delayFactor float64, reduceBatch bool, trigger string,
+	ewmaLatencyNs int64) time.Time {
 
-	// ── Delay: multiplicative increase ──
+	curDelay := time.Duration(params.Delay.Load())
+	curBatch := int(params.BatchSize.Load())
+
+	// Delay: multiplicative increase.
 	newDelay := time.Duration(float64(curDelay) * delayFactor)
-	maxDelay := c.effectiveMaxDelay()
+	maxDelay := effectiveMaxDelay(baselineNs, cfg)
 	if newDelay > maxDelay {
 		newDelay = maxDelay
 	}
-	c.Params.Delay.Store(int64(newDelay))
+	params.Delay.Store(int64(newDelay))
 
-	// ── Batch: hybrid decrease ──
+	// Batch: hybrid decrease (optional).
+	newBatch := curBatch
 	if reduceBatch {
-		var newBatch int
 		if curBatch < 10 {
-			// Small batches: subtract 1 to avoid jumping below minimum.
 			newBatch = curBatch - 1
 		} else {
-			// Larger batches: multiplicative decrease.
-			newBatch = int(float64(curBatch) * c.cfg.BatchBackoff)
+			newBatch = int(float64(curBatch) * cfg.BatchBackoff)
 		}
-		if newBatch < c.cfg.MinBatchSize {
-			newBatch = c.cfg.MinBatchSize
+		if newBatch < cfg.MinBatchSize {
+			newBatch = cfg.MinBatchSize
 		}
-		c.Params.BatchSize.Store(int32(newBatch))
-
-		c.cfg.Logger.Warn("[throttle] backoff",
-			"trigger", trigger,
-			"delay", newDelay,
-			"batch", newBatch,
-			"ewma", time.Duration(c.ewmaLatencyNs.Load()),
-			"baseline", time.Duration(c.baselineNs.Load()),
-		)
-	} else {
-		c.cfg.Logger.Warn("[throttle] backoff",
-			"trigger", trigger,
-			"delay", newDelay,
-			"batch", curBatch,
-			"ewma", time.Duration(c.ewmaLatencyNs.Load()),
-			"baseline", time.Duration(c.baselineNs.Load()),
-		)
+		params.BatchSize.Store(int32(newBatch))
 	}
 
-	// Enter cooldown.
-	c.state.Store(stateCooldown)
+	cfg.Logger.Warn("[throttle] backoff",
+		"trigger", trigger,
+		"delay", newDelay,
+		"batch", newBatch,
+		"ewma", time.Duration(ewmaLatencyNs),
+		"baseline", time.Duration(baselineNs),
+	)
 
-	// Schedule cooldown expiration: the decision loop will transition
-	// back to normal after cfg.CooldownTime elapses (checked via cycle count).
-	go func() {
-		time.Sleep(c.cfg.CooldownTime)
-		c.state.CompareAndSwap(stateCooldown, stateNormal)
-	}()
+	return time.Now().Add(cfg.CooldownTime)
 }
 
 // effectiveMaxDelay returns the dynamic ceiling: max(cfg.MaxDelay, 3×baseline).
-func (c *Controller) effectiveMaxDelay() time.Duration {
-	baseline := time.Duration(c.baselineNs.Load())
+func effectiveMaxDelay(baselineNs int64, cfg Config) time.Duration {
+	baseline := time.Duration(baselineNs)
 	dynamic := 3 * baseline
-	if dynamic > c.cfg.MaxDelay {
+	if dynamic > cfg.MaxDelay {
 		return dynamic
 	}
-	return c.cfg.MaxDelay
+	return cfg.MaxDelay
 }

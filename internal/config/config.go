@@ -31,6 +31,9 @@ type Config struct {
 	StateFile string `json:"state_file"` // Path to job resume state file
 	Resume    bool   `json:"resume"`     // If true, skip files already completed in StateFile
 
+	// Cache TTL: how long a translated entry stays valid (0 = never expire)
+	CacheTTL time.Duration `json:"cache_ttl"`
+
 	// Adaptive throttling
 	Adaptive bool `json:"adaptive"` // Enable adaptive delay/batch throttling
 }
@@ -114,6 +117,9 @@ func LoadFromFile(path string, cfg *Config) error {
 	}
 	if fileCfg.StateFile != "" {
 		cfg.StateFile = fileCfg.StateFile
+	}
+	if fileCfg.CacheTTL > 0 {
+		cfg.CacheTTL = fileCfg.CacheTTL
 	}
 
 	return nil
