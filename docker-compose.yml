@@ -15,7 +15,7 @@ services:
 
     environment:
       LT_LOAD_ONLY: "en,vi"
-      LT_THREADS: "1"
+      LT_THREADS: "3"             # match max_concurrency=3
       LT_DISABLE_WEB_UI: "true"
       LT_DISABLE_FILES_TRANSLATION: "true"
 
@@ -23,6 +23,11 @@ services:
       CT2_CUDA_ALLOW_FP16: "1"
       CUDA_VISIBLE_DEVICES: "0"
       CT2_CUDA_MEMORY_FRACTION: "0.7"
+
+    deploy:
+      resources:
+        limits:
+          memory: "4G"            # cap RAM — GPU mode dùng VRAM là chính
 
     volumes:
       - lt-models:/root/.local
@@ -43,9 +48,17 @@ services:
 
     environment:
       LT_LOAD_ONLY: "en,vi"
-      LT_THREADS: "2"
+      LT_THREADS: "3"             # match max_concurrency=3
       LT_DISABLE_WEB_UI: "true"
       LT_DISABLE_FILES_TRANSLATION: "true"
+      OMP_NUM_THREADS: "3"        # CTranslate2 inter-op threads
+      OPENBLAS_NUM_THREADS: "3"   # BLAS threads (dùng nếu backend là OpenBLAS)
+
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"             # cap CPU — tránh chiếm hết host
+          memory: "4G"            # cap RAM
 
     volumes:
       - lt-models:/home/libretranslate/.local

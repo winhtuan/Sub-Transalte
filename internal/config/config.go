@@ -35,7 +35,7 @@ type Config struct {
 	CacheTTL time.Duration `json:"cache_ttl"`
 
 	// Adaptive throttling
-	Adaptive bool `json:"adaptive"` // Enable adaptive delay/batch throttling
+	Adaptive bool `json:"adaptive"` // Enable adaptive delay/batch throttling (default: true)
 }
 
 // Default returns a Config with sensible defaults optimized for stable CPU usage.
@@ -56,6 +56,7 @@ func Default() *Config {
 		CacheFile:      ".subtranslate_cache.json",
 		StateFile:      ".subtranslate_state.json",
 		Resume:         false,
+		Adaptive:       true,
 	}
 }
 
