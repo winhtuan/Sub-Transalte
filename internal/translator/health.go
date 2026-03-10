@@ -49,7 +49,7 @@ func HealthCheck(ctx context.Context, apiURL string, httpClient *http.Client) (*
 		cancel()
 
 		if err == nil {
-			defer resp.Body.Close()
+			resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
 				return &HealthCheckResult{
 					Latency:     latency,

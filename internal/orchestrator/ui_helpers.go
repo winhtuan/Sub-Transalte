@@ -5,60 +5,44 @@ package orchestrator
 
 import (
 	"fmt"
-	"regexp"
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"subtranslate/internal/ui"
 )
 
 // ═══════════════════════════════════════════════════════════════════════
-// ANSI + Box drawing
+// ANSI + Box drawing — local aliases from the shared ui package
 // ═══════════════════════════════════════════════════════════════════════
 
 const (
-	cReset   = "\033[0m"
-	cRed     = "\033[31m"
-	cGreen   = "\033[32m"
-	cYellow  = "\033[33m"
-	cBlue    = "\033[34m"
-	cMagenta = "\033[35m"
-	cCyan    = "\033[36m"
-	cBold    = "\033[1m"
-	cDim     = "\033[2m"
+	cReset   = ui.Reset
+	cRed     = ui.Red
+	cGreen   = ui.Green
+	cYellow  = ui.Yellow
+	cBlue    = ui.Blue
+	cMagenta = ui.Magenta
+	cCyan    = ui.Cyan
+	cBold    = ui.Bold
+	cDim     = ui.Dim
 
-	escClearLine = "\033[2K"
-	escCursorUp  = "\033[%dA"
+	escClearLine = ui.ClearLine
+	escCursorUp  = ui.CursorUp
 )
 
-// Box inner width: visible characters between ║ and ║ (including 1-space margins).
-const boxInner = 51
+const dashIndent = "  "
 
-// ansiRe strips ANSI escape sequences for visible-width calculation.
-var ansiRe = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
-
-// visibleLen returns the number of visible characters in s (ignoring ANSI codes).
-func visibleLen(s string) int {
-	return utf8.RuneCountInString(ansiRe.ReplaceAllString(s, ""))
-}
-
-// boxTop / boxMid / boxBot draw the horizontal borders.
-func boxTop() string {
-	return fmt.Sprintf("  %s%s╔%s╗%s", cCyan, cBold, strings.Repeat("═", boxInner), cReset)
-}
-func boxMid() string {
-	return fmt.Sprintf("  %s%s╠%s╣%s", cCyan, cBold, strings.Repeat("═", boxInner), cReset)
-}
-func boxBot() string {
-	return fmt.Sprintf("  %s%s╚%s╝%s", cCyan, cBold, strings.Repeat("═", boxInner), cReset)
-}
+func boxTop() string { return ui.BoxTop(dashIndent) }
+func boxMid() string { return ui.BoxMid(dashIndent) }
+func boxBot() string { return ui.BoxBot(dashIndent) }
 
 // boxRow wraps content in ║ ... ║ with correct padding.
-// If content exceeds the box width, it is visually truncated.
+// If content exceeds the box width it is visually truncated.
 func boxRow(content string) string {
-	maxContent := boxInner - 2 // 1-space margin on each side
-	vLen := visibleLen(content)
+	maxContent := ui.BoxInner - 2 // 1-space margin on each side
+	vLen := ui.VisibleLen(content)
 	if vLen > maxContent {
-		// Truncate: walk runes, skip ANSI sequences, cut at maxContent-1 visible chars + "…"
 		content = truncateAnsi(content, maxContent-1) + "…"
 		vLen = maxContent
 	}
@@ -66,8 +50,8 @@ func boxRow(content string) string {
 	if pad < 0 {
 		pad = 0
 	}
-	return fmt.Sprintf("  %s%s║%s %s%s %s%s║%s",
-		cCyan, cBold, cReset,
+	return fmt.Sprintf("%s%s%s║%s %s%s %s%s║%s",
+		dashIndent, cCyan, cBold, cReset,
 		content, strings.Repeat(" ", pad),
 		cCyan, cBold, cReset)
 }

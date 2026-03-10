@@ -10,7 +10,9 @@ RUN apt-get update && apt-get install -y \
 RUN pip install --no-cache-dir \
     libretranslate \
     ctranslate2[argos] \
-    argostranslate
+    argostranslate \
+    "urllib3<2" \
+    "charset-normalizer<3"
 
 # GPU tuning (very important for 4GB VRAM)
 ENV CT2_FORCE_CUDA=1

@@ -71,14 +71,13 @@ func Parse(r io.Reader) ([]Subtitle, error) {
 			if trimmed == "" {
 				continue
 			}
-			_, err := strconv.Atoi(trimmed)
+			idx, err := strconv.Atoi(trimmed)
 			if err != nil {
 				slog.Default().Warn("srt: bad subtitle index — skipping block",
 					"line", lineNum, "content", line)
 				state = stateSkipping
 				continue
 			}
-			idx, _ := strconv.Atoi(trimmed)
 			current = &Subtitle{Index: idx}
 			state = stateTimestamp
 

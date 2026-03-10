@@ -4,51 +4,28 @@ package report
 import (
 	"fmt"
 	"io"
-	"regexp"
 	"strings"
 	"time"
-	"unicode/utf8"
+
+	"subtranslate/internal/ui"
 )
 
+// local aliases to keep call-sites unchanged.
 const (
-	cReset  = "\033[0m"
-	cRed    = "\033[31m"
-	cGreen  = "\033[32m"
-	cYellow = "\033[33m"
-	cCyan   = "\033[36m"
-	cBold   = "\033[1m"
-	cDim    = "\033[2m"
+	cReset  = ui.Reset
+	cRed    = ui.Red
+	cGreen  = ui.Green
+	cYellow = ui.Yellow
+	cCyan   = ui.Cyan
+	cBold   = ui.Bold
+	cDim    = ui.Dim
 )
 
-const boxInner = 51
+func boxTop() string { return ui.BoxTop("") }
+func boxMid() string { return ui.BoxMid("") }
+func boxBot() string { return ui.BoxBot("") }
 
-var ansiRe = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
-
-func visibleLen(s string) int {
-	return utf8.RuneCountInString(ansiRe.ReplaceAllString(s, ""))
-}
-
-func boxTop() string {
-	return fmt.Sprintf("%s%s╔%s╗%s", cCyan, cBold, strings.Repeat("═", boxInner), cReset)
-}
-func boxMid() string {
-	return fmt.Sprintf("%s%s╠%s╣%s", cCyan, cBold, strings.Repeat("═", boxInner), cReset)
-}
-func boxBot() string {
-	return fmt.Sprintf("%s%s╚%s╝%s", cCyan, cBold, strings.Repeat("═", boxInner), cReset)
-}
-
-func boxRow(content string) string {
-	vLen := visibleLen(content)
-	pad := boxInner - 2 - vLen
-	if pad < 0 {
-		pad = 0
-	}
-	return fmt.Sprintf("%s%s║%s %s%s %s%s║%s",
-		cCyan, cBold, cReset,
-		content, strings.Repeat(" ", pad),
-		cCyan, cBold, cReset)
-}
+func boxRow(content string) string { return ui.BoxRow("", content) }
 
 // Stats holds the statistics collected during a translation run.
 type Stats struct {
